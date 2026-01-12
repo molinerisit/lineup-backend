@@ -21,7 +21,6 @@ let lastDeviceStatus = {
   mapping: [],
   timestamp: null,
 };
-
 const ESP_HARDWARE_IDS = [
   "HELADERA-01",
   "HELADERA-02",
@@ -42,21 +41,6 @@ mongoose
 
 app.use(express.json());
 app.use(cors({ origin: "*" }));
-
-// ==========================================
-// MIDDLEWARE DE AUTENTICACIÓN
-// ==========================================
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-  if (!token) return res.sendStatus(401);
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
-    next();
-  });
-};
 
 // ==========================================
 // FUNCIONES DE ENVÍO WHATSAPP (ESTABLES)
@@ -94,13 +78,14 @@ const responderWhatsAppConImagen = async (number, imageUrl, caption = "") => {
 };
 
 const sendWhatsAppAlert = async (number, sensorName, temp) => {
-  // Cambiamos de botones a Texto Formateado para evitar el Error 400
   const mensaje =
     `🚨 *ALERTA DE TEMPERATURA*\n\n` +
     `📍 *Equipo:* ${sensorName}\n` +
     `🌡️ *Temperatura:* ${temp}°C\n\n` +
-    `⚠️ _El límite ha sido superado._\n` +
-    `👉 Escribe *Estado* para ver todos tus equipos.`;
+    `⚠️ _Límite superado. Silencio activo por ${
+      process.env.ALERT_COOLDOWN || 30
+    } min._\n` +
+    `👉 Escribe *Estado* para consultar todo.`;
 
   await responderWhatsApp(number, mensaje);
 };
@@ -152,7 +137,7 @@ app.post("/api/data", async (req, res) => {
 app.post("/api/webhook/whatsapp", async (req, res) => {
   try {
     const data = req.body.data;
-    if (!data.message) return res.sendStatus(200);
+    if (!data || !data.message) return res.sendStatus(200);
 
     const text = (
       data.message.conversation ||
@@ -166,7 +151,7 @@ app.post("/api/webhook/whatsapp", async (req, res) => {
     const user = await User.findOne({ whatsapp: from });
     if (!user) return res.sendStatus(200);
 
-    console.log(`💬 Comando recibido: ${text}`);
+    console.log(`💬 Comando recibido de ${from}: ${text}`);
 
     // COMANDO: ESTADO
     if (text === "estado") {
@@ -184,7 +169,7 @@ app.post("/api/webhook/whatsapp", async (req, res) => {
       await responderWhatsApp(from, reporte);
     }
 
-    // COMANDO: HISTORIAL
+    // COMANDO: HISTORIAL + GRÁFICO
     if (text.startsWith("historial")) {
       const busqueda = text.replace("historial", "").trim();
       const sensor = await Sensor.findOne({
@@ -208,32 +193,59 @@ app.post("/api/webhook/whatsapp", async (req, res) => {
                 {
                   label: "Temperatura °C",
                   data: docs.map((m) => m.temperatureC).reverse(),
-                  borderColor: "blue",
+                  borderColor: "#36A2EB",
                   fill: true,
-                  backgroundColor: "rgba(0,0,255,0.1)",
+                  backgroundColor: "rgba(54, 162, 235, 0.2)",
                 },
               ],
+            },
+            options: {
+              title: {
+                display: true,
+                text: `Historial: ${sensor.friendlyName}`,
+              },
             },
           });
           await responderWhatsAppConImagen(
             from,
             chart.getUrl(),
-            `📊 Historial: ${sensor.friendlyName}`
+            `📊 Historial de ${sensor.friendlyName}`
+          );
+        } else {
+          await responderWhatsApp(
+            from,
+            `📈 No hay mediciones recientes para ${sensor.friendlyName}.`
           );
         }
       } else {
-        await responderWhatsApp(from, `❌ No encontré el equipo "${busqueda}"`);
+        await responderWhatsApp(
+          from,
+          `❌ No encontré el equipo "${busqueda}".`
+        );
       }
     }
     res.sendStatus(200);
   } catch (err) {
+    console.error("Error Webhook:", err);
     res.sendStatus(500);
   }
 });
 
 // ==========================================
-// RUTAS RESTANTES (LOGIN, REGISTRO, PERFIL)
+// RUTAS DE AUTENTICACIÓN Y USUARIO
 // ==========================================
+
+const authenticateUser = (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
 
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -257,7 +269,11 @@ app.post("/api/auth/login", async (req, res) => {
   res.json({ token, username: user.username });
 });
 
-app.get("/api/latest", authenticateToken, async (req, res) => {
+// ==========================================
+// RUTAS FLUTTER Y SENSORES
+// ==========================================
+
+app.get("/api/latest", authenticateUser, async (req, res) => {
   try {
     const data = await Sensor.aggregate([
       {
@@ -293,7 +309,7 @@ app.get("/api/latest", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/api/sensors/config", authenticateToken, async (req, res) => {
+app.post("/api/sensors/config", authenticateUser, async (req, res) => {
   try {
     const sensorData = { ...req.body, owner: req.user.id, enabled: true };
     const sensor = await Sensor.findOneAndUpdate(
@@ -307,12 +323,12 @@ app.post("/api/sensors/config", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/api/auth/profile", authenticateToken, async (req, res) => {
+app.get("/api/auth/profile", authenticateUser, async (req, res) => {
   const user = await User.findById(req.user.id).select("-password");
   res.json(user);
 });
 
-app.put("/api/auth/profile", authenticateToken, async (req, res) => {
+app.put("/api/auth/profile", authenticateUser, async (req, res) => {
   try {
     const { whatsapp, oldPassword, newPassword } = req.body;
     const user = await User.findById(req.user.id);
@@ -330,7 +346,7 @@ app.put("/api/auth/profile", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/api/history", authenticateToken, async (req, res) => {
+app.get("/api/history", authenticateUser, async (req, res) => {
   const { sensorId, limit = 100 } = req.query;
   const sensor = await Sensor.findOne({
     hardwareId: sensorId,
@@ -343,7 +359,7 @@ app.get("/api/history", authenticateToken, async (req, res) => {
   res.json(docs);
 });
 
-app.delete("/api/sensors/:hardwareId", authenticateToken, async (req, res) => {
+app.delete("/api/sensors/:hardwareId", authenticateUser, async (req, res) => {
   await Sensor.deleteOne({
     hardwareId: req.params.hardwareId,
     owner: req.user.id,
@@ -352,10 +368,15 @@ app.delete("/api/sensors/:hardwareId", authenticateToken, async (req, res) => {
   res.json({ message: "Eliminado" });
 });
 
-app.get("/api/sensors/ids", authenticateToken, (req, res) =>
+app.get("/api/sensors/ids", authenticateUser, (req, res) =>
   res.json(ESP_HARDWARE_IDS)
 );
-app.get("/api/device/status", authenticateToken, (req, res) =>
+app.post("/api/device/status", async (req, res) => {
+  const { ip, mapping } = req.body;
+  lastDeviceStatus = { online: true, ip, mapping, timestamp: new Date() };
+  res.json({ message: "Sincronizado" });
+});
+app.get("/api/device/status", authenticateUser, (req, res) =>
   res.json(lastDeviceStatus)
 );
 
